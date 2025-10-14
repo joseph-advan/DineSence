@@ -1,5 +1,4 @@
-# customer_analysis_mvp/services/vision_analysis.py
-
+# services/vision_analysis.py
 """
 本模組包含所有電腦視覺相關的函式與類別。
 - 初始化與提供 YOLOv8、MediaPipe 等模型。
@@ -14,7 +13,14 @@ import mediapipe as mp
 from ultralytics import YOLO
 
 # 從我們的設定檔導入常數
-from config import YOLO_MODEL_PATH, FOODISH_CLASSES, NOD_BUFFER_LEN
+# <--- MODIFIED: 導入了所有 NodDetector 需要的參數
+from config import (
+    YOLO_MODEL_PATH,
+    FOODISH_CLASSES,
+    NOD_BUFFER_LEN,
+    NOD_AMP_THRESH,
+    NOD_COOLDOWN_SECONDS
+)
 
 # --- 模型初始化 ---
 # 這些模型物件在模組首次被導入時僅會被載入一次，效率較高。
@@ -30,6 +36,7 @@ except Exception as e:
 mp_pose_solution = mp.solutions.pose
 mp_face_solution = mp.solutions.face_detection
 
+
 def get_pose_detector():
     """返回一個新的 MediaPipe Pose 偵測器實例。"""
     return mp_pose_solution.Pose(
@@ -39,6 +46,7 @@ def get_pose_detector():
         min_tracking_confidence=0.5
     )
 
+
 def get_face_detector():
     """返回一個新的 MediaPipe Face Detection 偵測器實例。"""
     return mp_face_solution.FaceDetection(
@@ -46,7 +54,8 @@ def get_face_detector():
         min_detection_confidence=0.5
     )
 
-# --- (A) 餐盤殘留分析 ---
+
+# --- (A) 餐盤殘留分析 (此部分邏輯不變) ---
 def estimate_plate_leftover(bgr_frame):
     """
     使用霍夫圓轉換與顏色閾值估計餐盤殘留量。
@@ -98,12 +107,13 @@ class NodDetector:
     """
     一個有狀態的類別，用於偵測連續畫面中的點頭動作。
     """
-    def __init__(self, buf_len=NOD_BUFFER_LEN, amp_thresh=0.03, cooldown=1.0):
+    # <--- MODIFIED: __init__ 的預設值現在全部來自 config.py
+    def __init__(self, buf_len=NOD_BUFFER_LEN, amp_thresh=NOD_AMP_THRESH, cooldown=NOD_COOLDOWN_SECONDS):
         self.y_hist = deque(maxlen=buf_len)
         self.last_nod_ts = 0.0
         self.amp_thresh = amp_thresh
         self.cooldown = cooldown
-        self.count = 0
+        self.count = 0 # 這個 count 其實可以移除，因為計數邏輯已移至 UI 層
 
     def update_and_check(self, nose_y, ref_y):
         rel = nose_y - ref_y
@@ -121,12 +131,11 @@ class NodDetector:
         now = time.time()
         if amp > self.amp_thresh and sign_changes >= 2 and (now - self.last_nod_ts) > self.cooldown:
             self.last_nod_ts = now
-            self.count += 1
             return True
         return False
 
 
-# --- (C) 臉部裁切 ---
+# --- (C) 臉部裁切 (此部分邏輯不變) ---
 def crop_face_with_mediapipe(bgr_frame, detector, min_conf=0.6):
     """使用 MediaPipe 偵測並裁切出臉部 ROI。"""
     rgb = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2RGB)
@@ -144,7 +153,7 @@ def crop_face_with_mediapipe(bgr_frame, detector, min_conf=0.6):
     return bgr_frame[y1:y2, x1:x2]
 
 
-# --- (D) YOLO 食物/杯子偵測 ---
+# --- (D) YOLO 食物/杯子偵測 (此部分邏輯不變) ---
 def detect_food_regions_yolo(bgr, conf=0.3, min_area_ratio=0.01):
     """使用 YOLOv8 偵測所有與食物相關的物件。"""
     if not _yolo_ok: return []
@@ -169,7 +178,6 @@ def detect_food_regions_yolo(bgr, conf=0.3, min_area_ratio=0.01):
             "label": name,
             "conf": float(b.conf.item())
         })
-    # 按面積大小排序，讓最大的物件在最前面
     out.sort(key=lambda d: (d["xyxy"][2]-d["xyxy"][0])*(d["xyxy"][3]-d["xyxy"][1]), reverse=True)
     return out
 
@@ -187,3 +195,4 @@ def has_big_cup(bgr, min_area_ratio=0.04):
             if ((x2 - x1) * (y2 - y1)) / (w * h) >= min_area_ratio:
                 return True
     return False
+

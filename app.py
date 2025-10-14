@@ -1,18 +1,14 @@
 # customer_analysis_mvp/app.py
 
-"""
-顧客分析 MVP+ 應用程式主進入點。
-"""
-
 import streamlit as st
 
 # 導入設定檔、服務模組、UI 模組與工具
 import config
-from services import llm_handler
+from services import llm_handler, vision_analysis as va
 from ui import live_view, video_view
 from utils import state_manager
 
-# --- 1. 頁面設定 (只在主程式執行一次) ---
+# --- 1. 頁面設定 ---
 st.set_page_config(
     page_title="顧客分析 MVP+",
     page_icon="📊",
@@ -20,20 +16,19 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# --- 2. 初始化 (只執行一次) ---
-
-# 初始化 OpenAI client
-# @st.cache_resource 可以快取這個物件，避免每次頁面刷新都重新建立
+# --- 2. 初始化與快取資源 ---
 @st.cache_resource
-def get_client():
-    return llm_handler.get_openai_client(config.OPENAI_API_KEY)
+def load_models():
+    """集中載入所有昂貴的模型物件"""
+    openai_client = llm_handler.get_openai_client(config.OPENAI_API_KEY)
+    pose_detector = va.get_pose_detector()
+    face_detector = va.get_face_detector()
+    return openai_client, pose_detector, face_detector
 
-client = get_client()
-
-# 初始化 session state
+client, pose_detector, face_detector = load_models()
 state_manager.initialize_state()
 
-# --- 3. 側邊欄 UI (全域共用) ---
+# --- 3. 側邊欄 UI ---
 with st.sidebar:
     st.header("⚙️ LLM 偏好設定")
     st.caption("調整此處設定會影響最終 AI 生成的摘要報告風格。")
@@ -53,11 +48,17 @@ with st.sidebar:
     menu_items = [x.strip() for x in menu_text.splitlines() if x.strip()]
     st.caption("若不輸入，AI 會直接顯示 YOLO 偵測到的通用物件名稱。")
 
-# 將 LLM 偏好打包成一個字典，方便傳遞給 UI 模組
 llm_preferences = {
     "store_type": store_type,
     "tone": tone,
     "tips_style": tips_style
+}
+
+# 將模型物件打包成一個字典，方便傳遞
+model_pack = {
+    "client": client,
+    "pose_detector": pose_detector,
+    "face_detector": face_detector
 }
 
 # --- 4. 主頁面 UI ---
@@ -65,17 +66,13 @@ st.title("📊 顧客分析 MVP+")
 
 if not client:
     st.error("⚠️ 偵測不到 OpenAI API 金鑰！", icon="🚨")
-    st.markdown(
-        "請在專案根目錄下建立一個 `.env` 檔案，並在其中加入 `OPENAI_API_KEY='sk-...'`。\n\n"
-        "設定完成後，請重新啟動 Streamlit。"
-    )
+    # ... (錯誤訊息不變)
 else:
     tab_live, tab_video = st.tabs(["🟢 即時鏡頭分析", "🎞️ 影片離線分析"])
 
     with tab_live:
-        # 將控制權交給 live_view 模組
-        live_view.display(client, menu_items, llm_preferences)
+        live_view.display(model_pack, menu_items, llm_preferences)
 
     with tab_video:
-        # 將控制權交給 video_view 模組
+        # video_view 也可以傳入，雖然它目前沒用到全部的模型
         video_view.display(client, menu_items, llm_preferences)

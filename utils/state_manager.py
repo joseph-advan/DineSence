@@ -5,7 +5,7 @@
 """
 
 import streamlit as st
-from collections import Counter, deque
+from collections import Counter
 
 def initialize_state():
     """
@@ -13,13 +13,17 @@ def initialize_state():
     此函式應在主程式 app.py 的最開始被呼叫一次。
     """
     states = {
+        # --- 統計計數器 ---
         "nod_count": 0,
         "emotion_counter": Counter(),
         "leftover_counter": Counter(),
-        "food_hist": deque(maxlen=5), # 用於即時模式下的食物辨識多幀投票
-        "food_last_ts": 0.0,
+        
+        # --- 核心物件 ---
+        # 用於存放 LiveAnalyzer 引擎的實例，確保它在 reruns 之間持續存在
+        "analyzer": None,
     }
 
     for key, default_value in states.items():
         if key not in st.session_state:
             st.session_state[key] = default_value
+

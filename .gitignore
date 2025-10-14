@@ -41,3 +41,6 @@ venv.bak/
 # temp files from video upload
 tmp_*.mp4
 tmp_*.avi
+
+
+yolov8n.pt

@@ -36,7 +36,6 @@ def display(model_pack: dict, menu_items: list, llm_preferences: dict):
         
         st.divider()
         st.subheader("控制")
-        # 使用 key="live_toggle" 讓 Streamlit 追蹤此元件的狀態
         run_live = st.toggle("開啟鏡頭", value=False, key="live_toggle")
         fps_display = st.slider("UI 更新 FPS 上限", 5, 30, 20)
         
@@ -48,7 +47,6 @@ def display(model_pack: dict, menu_items: list, llm_preferences: dict):
         
         st.divider()
         
-        # --- [MODIFIED] 摘要按鈕邏輯 ---
         if st.button("產生摘要（LLM）", use_container_width=True, disabled=not model_pack.get("client")):
             stats = {
                 "nod": st.session_state.nod_count,
@@ -56,48 +54,42 @@ def display(model_pack: dict, menu_items: list, llm_preferences: dict):
                 "leftover": dict(st.session_state.leftover_counter),
             }
             with st.spinner("LLM 摘要生成中..."):
-                # 接收 (摘要文字, Token用量) 元組
                 summary, usage = asyncio.run(llm.summarize_session(
                     stats, **llm_preferences, client=model_pack["client"]
                 ))
                 
-                # 如果成功獲取 Token 用量，就進行累加
                 if usage:
-                    st.session_state.session_token_usage['prompt_tokens'] += usage.prompt_tokens
-                    st.session_state.session_token_usage['completion_tokens'] += usage.completion_tokens
-                    st.session_state.session_token_usage['total_tokens'] += usage.total_tokens
+                    # [說明] Counter 的 update 方法可以直接累加字典的值
+                    st.session_state.session_token_usage.update({
+                        'prompt_tokens': usage.prompt_tokens,
+                        'completion_tokens': usage.completion_tokens,
+                        'total_tokens': usage.total_tokens
+                    })
                 
-                # 將摘要結果暫存到 session_state，以便 Session 結束時儲存
                 st.session_state.current_summary = summary
 
             st.success("今日摘要")
-            # 顯示暫存的摘要
             st.write(st.session_state.get("current_summary", "尚未產生摘要。"))
 
-    # --- [NEW] Session 開始與結束的核心邏輯 ---
+    # --- Session 開始與結束的核心邏輯 (不變) ---
     current_toggle_state = run_live
     last_toggle_state = st.session_state.live_toggle_last_state
 
-    # 偵測到「開啟」事件
     if current_toggle_state and not last_toggle_state:
         st.toast("新的 Session 已開始！", icon="▶️")
-        # 重設所有計數器
         st.session_state.nod_count = 0
         st.session_state.emotion_counter = Counter()
         st.session_state.leftover_counter = Counter()
         st.session_state.session_token_usage = Counter()
-        st.session_state.current_summary = "" # 清空上次的摘要
-        # 記錄開始時間
+        st.session_state.current_summary = ""
         st.session_state.session_start_time = datetime.now()
 
-    # 偵測到「關閉」事件
     if not current_toggle_state and last_toggle_state:
         st.toast("Session 已結束並儲存紀錄。", icon="💾")
         end_time = datetime.now()
         start_time = st.session_state.session_start_time
         duration = (end_time - start_time).total_seconds() if start_time else 0
         
-        # 打包所有數據
         session_data = {
             "start_time": start_time.strftime("%Y-%m-%d %H:%M:%S") if start_time else "N/A",
             "duration_seconds": int(duration),
@@ -107,10 +99,8 @@ def display(model_pack: dict, menu_items: list, llm_preferences: dict):
             "token_usage": dict(st.session_state.session_token_usage),
             "summary": st.session_state.get("current_summary", "無摘要")
         }
-        # 將打包好的數據存入歷史紀錄列表
-        st.session_state.session_history.insert(0, session_data) # insert(0, ..) 讓最新的在最前面
+        st.session_state.session_history.insert(0, session_data)
 
-    # 更新上一次的狀態，為下一次偵測做準備
     st.session_state.live_toggle_last_state = current_toggle_state
 
     # --- 引擎生命週期管理 (不變) ---
@@ -121,7 +111,7 @@ def display(model_pack: dict, menu_items: list, llm_preferences: dict):
         st.session_state.analyzer.stop()
         st.session_state.analyzer = None
 
-    # --- 主顯示迴圈 (不變) ---
+    # --- 主顯示迴圈 ---
     with lcol:
         st.subheader("📹 即時監視畫面")
         frame_slot = st.empty()
@@ -135,12 +125,19 @@ def display(model_pack: dict, menu_items: list, llm_preferences: dict):
                 continue
 
             analysis_result = st.session_state.analyzer.get_latest_analysis_result()
+            
+            # --- [核心修正] ---
             if analysis_result:
                 latest_analysis_data = analysis_result
                 if analysis_result.nod_event: st.session_state.nod_count += 1
                 if analysis_result.emotion_event: st.session_state.emotion_counter[analysis_result.emotion_event] += 1
                 if analysis_result.plate_event: st.session_state.leftover_counter[analysis_result.plate_event] += 1
+                
+                # --- [新增] 累加每一次情緒分析的 Token ---
+                if analysis_result.token_usage_event:
+                    st.session_state.session_token_usage.update(analysis_result.token_usage_event)
             
+            # --- 繪圖邏輯 (不變) ---
             display_info = latest_analysis_data.display_info
             cv2.putText(frame, f"[Nod] {st.session_state.nod_count}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0,200,0), 2)
             emotion_to_show = latest_analysis_data.emotion_event or "N/A"
@@ -160,29 +157,25 @@ def display(model_pack: dict, menu_items: list, llm_preferences: dict):
     else:
         frame_slot.info("請點擊「開啟鏡頭」以開始即時分析。")
 
-    # --- [NEW] 歷史紀錄 UI 呈現 ---
+    # --- 歷史紀錄 UI 呈現 (不變) ---
     with rcol:
         st.divider()
         st.subheader("📜 本次運行歷史紀錄")
         if not st.session_state.session_history:
             st.caption("目前尚無歷史紀錄。關閉鏡頭後將會儲存一筆紀錄。")
 
-        # 遍歷所有歷史紀錄 (最新的在最上面)
         for i, session_data in enumerate(st.session_state.session_history):
-            # 預設只展開最新的一筆
             expander = st.expander(
                 f"**Session @ {session_data['start_time']}** (持續 {session_data['duration_seconds']} 秒)",
                 expanded=(i == 0)
             )
             with expander:
-                # 找出出現最多次的情緒
                 emotions = session_data['emotion_counter']
                 if emotions:
                     max_emotion = max(emotions, key=emotions.get)
                     st.write(f"**主要情緒: {max_emotion}**")
                     
-                    # 顯示所有情緒並 Highlight 最高者
-                    for emotion, count in emotions.items():
+                    for emotion, count in sorted(emotions.items(), key=lambda item: item[1], reverse=True):
                         if emotion == max_emotion:
                             st.markdown(f"&nbsp;&nbsp;&nbsp;**- {emotion}: {count} 次 (最高)**")
                         else:
@@ -199,7 +192,7 @@ def display(model_pack: dict, menu_items: list, llm_preferences: dict):
                 else:
                     st.caption("無餐盤紀錄")
 
-                st.write("**Token 用量:**")
+                st.write("**Token 用量 (情緒分析 + 摘要):**")
                 tokens = session_data['token_usage']
                 st.markdown(f"&nbsp;&nbsp;&nbsp;- 總計: `{tokens.get('total_tokens', 0)}`")
                 st.markdown(f"&nbsp;&nbsp;&nbsp;- 輸入: `{tokens.get('prompt_tokens', 0)}`")

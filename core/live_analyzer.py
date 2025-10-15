@@ -123,6 +123,21 @@ class LiveAnalyzer:
                     ref_y = (lm[11].y + lm[12].y) / 2 if len(lm) > 12 else 0.5
                     if nod_detector.update_and_check(nose_y, ref_y):
                         nod_event = True
+            # --- 新增開始 ---
+            # 2.1 執行餐盤殘留分析
+            if self.analysis_options.get("opt_plate"):
+                # 呼叫 vision_analysis 模組中的函式
+                label, ratio, circle = va.estimate_plate_leftover(frame)
+
+                # 如果偵測到有效的狀態，就設定事件
+                if label in ["剩餘50%以上", "無剩餘"]:
+                    plate_event = label
+
+                # 無論如何，都將資訊更新到 display_info 以便 UI 顯示
+                display_info["plate_label"] = label
+                if circle:
+                    display_info["plate_circle"] = circle
+            # --- 新增結束 ---
             
             # 3. 將所有結果打包成標準格式
             result = FrameResult(

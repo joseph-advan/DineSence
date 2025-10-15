@@ -42,3 +42,5 @@ NOD_COOLDOWN_SECONDS = 1.0    # 偵測到一次點頭後的冷卻時間
 # 在多執行緒環境下，稍微拉長此間隔有助於穩定性和成本控制
 EMOTE_INTERVAL_SECONDS = 1.5
 
+
+

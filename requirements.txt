@@ -7,3 +7,4 @@ Pillow==11.3.0
 httpx == 0.26.0
 ultralytics
 python-dotenv
+plotly

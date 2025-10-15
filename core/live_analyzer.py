@@ -1,8 +1,12 @@
 # core/live_analyzer.py
+
 """
+【版本 2.0 - 高流暢度版】
 即時分析引擎 (LiveAnalyzer) 的主類別。
-這個類別封裝了所有關於影像擷取、多執行緒、佇列通訊及背景分析的複雜邏輯。
-UI 層只需要與這個類別的 start(), stop(), get_latest_result() 方法互動即可。
+此版本徹底分離了影像流與數據流，以實現流暢的 UI 畫面更新。
+- 影像流: 透過 _frame_display_queue 直接將原始畫面高速傳送至 UI。
+- 數據流: _analysis_worker 執行緒將耗時的分析結果放入 _analysis_result_queue。
+UI 層可以獨立地、非同步地獲取這兩者。
 """
 
 import cv2
@@ -10,14 +14,17 @@ import time
 import asyncio
 import threading
 from queue import Queue, Empty, Full
-from typing import Optional
+from typing import Optional, Dict
+import numpy as np
 
-# 從同一個 core 目錄導入我們定義的數據結構
-from .types import FrameResult
 # 從外部服務導入功能
 from services import vision_analysis as va
 from services import llm_handler as llm
-from config import EMOTE_INTERVAL_SECONDS
+from config import EMOTE_INTERVAL_SECONDS, CAMERA_RESOLUTION_WIDTH, CAMERA_RESOLUTION_HEIGHT, CAMERA_BUFFER_SIZE
+
+# --- 導入新的數據結構 ---
+# 我們需要一個新的 dataclass 只用來存放分析結果
+from .types import AnalysisResult
 
 class LiveAnalyzer:
     def __init__(self, model_pack: dict, menu_items: list, analysis_options: dict):
@@ -25,10 +32,15 @@ class LiveAnalyzer:
         self.menu_items = menu_items
         self.analysis_options = analysis_options
         
-        # 建立兩個佇列用於執行緒間通訊
-        # 佇列大小設為1，確保我們永遠只處理最新的畫面，避免延遲累積
-        self._frame_queue = Queue(maxsize=1)  # 存放待分析的原始畫面
-        self._result_queue = Queue(maxsize=1) # 存放已分析完成的結果
+        # --- MODIFIED: 建立三條獨立的佇列 ---
+        # 1. 高速公路: 原始畫面直送 UI，確保流暢度
+        self._frame_display_queue = Queue(maxsize=CAMERA_BUFFER_SIZE)
+        
+        # 2. 待辦事項: 待分析的原始畫面
+        self._frame_analysis_queue = Queue(maxsize=CAMERA_BUFFER_SIZE) 
+        
+        # 3. 慢車道: 已分析完成的數據結果
+        self._analysis_result_queue = Queue(maxsize=CAMERA_BUFFER_SIZE)
         
         # 用於優雅地停止執行緒的事件信號
         self._stop_event = threading.Event()
@@ -38,14 +50,16 @@ class LiveAnalyzer:
     def _camera_loop(self):
         """
         [執行緒 1: 生產者]
-        這個函式在獨立的執行緒中運行，專門負責從攝影機抓取畫面，
-        並將畫面放入 `_frame_queue`。
+        專門負責從攝影機抓取畫面，並立即將原始畫面放入兩個佇列：
+        一個給 UI 即時顯示，一個給背景分析。
         """
         cap = cv2.VideoCapture(0)
         if not cap.isOpened():
             print("錯誤：無法開啟攝影機。")
-            # 可以在此處將錯誤訊息放入結果佇列，讓 UI 知道
             return
+            
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_RESOLUTION_WIDTH)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_RESOLUTION_HEIGHT)
 
         while not self._stop_event.is_set():
             ok, frame = cap.read()
@@ -53,27 +67,27 @@ class LiveAnalyzer:
                 time.sleep(0.1)
                 continue
             
-            # 使用非阻塞方式放入佇列，以維持攝影機畫面的即時性
+            # --- MODIFIED: 將畫面同時放入兩個佇列 ---
+            # 使用非阻塞方式，如果佇列滿了就丟棄舊的，確保即時性
             try:
-                self._frame_queue.put_nowait(frame)
+                self._frame_display_queue.put_nowait(frame)
             except Full:
-                # 如果佇列是滿的（代表分析執行緒來不及處理），
-                # 就把舊的畫面丟掉，換成最新的畫面。
-                try:
-                    self._frame_queue.get_nowait()
-                except Empty:
-                    pass
-                self._frame_queue.put_nowait(frame)
+                pass # 顯示佇列滿了沒關係，代表 UI 暫時跟不上，下一幀就好
 
-            time.sleep(0.03) # 控制擷取頻率約 30 FPS
+            try:
+                self._frame_analysis_queue.put_nowait(frame)
+            except Full:
+                pass # 分析佇列滿了也沒關係，代表分析執行緒忙不過來
+
+            time.sleep(0.02) # 控制擷取頻率約 30-50 FPS
         
         cap.release()
 
     def _analysis_worker(self):
         """
         [執行緒 2: 消費者]
-        這個函式在另一個獨立的執行緒中運行，負責從 `_frame_queue` 取出畫面，
-        執行所有耗時的 CV 和 LLM 分析，然後將結果放入 `_result_queue`。
+        負責從 _frame_analysis_queue 取出畫面，執行所有耗時分析，
+        然後只將「分析結果數據」放入 _analysis_result_queue。
         """
         client = self.model_pack["client"]
         pose_detector = self.model_pack["pose_detector"]
@@ -83,37 +97,37 @@ class LiveAnalyzer:
 
         while not self._stop_event.is_set():
             try:
-                # 阻塞式等待，直到有新的畫面可以分析
-                frame = self._frame_queue.get(timeout=1)
+                frame = self._frame_analysis_queue.get(timeout=1)
             except Empty:
                 continue
 
-            # --- 執行所有分析任務 ---
-            nod_event = False
-            plate_event = ""
-            emotion_event = ""
-            display_info = {}
+            # --- 初始化本次分析的結果容器 ---
+            result = AnalysisResult()
 
-            # 1. 執行非同步的 LLM 任務
-            async def run_llm_tasks(frame_copy):
+            # --- 1. 執行非同步的 LLM 任務 (表情分析) ---
+            # 這個設計確保了 LLM 呼叫不會阻塞下面的 CV 任務
+            async def run_emotion_task(frame_copy):
                 nonlocal last_emote_ts
-                tasks = []
                 if self.analysis_options.get("opt_emote") and client and (time.time() - last_emote_ts) > EMOTE_INTERVAL_SECONDS:
-                    face_crop = va.crop_face_with_mediapipe(frame_copy, face_detector)
-                    tasks.append(llm.gpt_image_classify_3cls(face_crop, client))
                     last_emote_ts = time.time()
-                else:
-                    tasks.append(asyncio.sleep(0, result="")) # 空任務佔位
+                    face_crop = va.crop_face_with_mediapipe(frame_copy, face_detector)
+
+                    # [MODIFIED] 接收 (emotion, usage) 元組
+                    emotion, usage = await llm.gpt_image_classify_3cls(face_crop, client)
+
+                    if emotion and emotion not in ["無臉", "API 錯誤", ""]:
+                        result.emotion_event = emotion
+                    if usage:
+                        # [NEW] 將 usage 存入 AnalysisResult
+                        result.token_usage_event = {
+                            "prompt_tokens": usage.prompt_tokens,
+                            "completion_tokens": usage.completion_tokens,
+                            "total_tokens": usage.total_tokens
+                        }
                 
-                return await asyncio.gather(*tasks)
+            asyncio.run(run_emotion_task(frame.copy()))
 
-            llm_results = asyncio.run(run_llm_tasks(frame.copy()))
-            emote_cls = llm_results[0]
-            if emote_cls and emote_cls not in ["無臉", "API 錯誤", ""]:
-                emotion_event = emote_cls
-            display_info["emotion"] = emote_cls
-
-            # 2. 執行同步的 CV 任務
+            # --- 2. 執行同步的 CV 任務 ---
             if self.analysis_options.get("opt_nod"):
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 res = pose_detector.process(rgb)
@@ -122,75 +136,51 @@ class LiveAnalyzer:
                     nose_y = lm[0].y
                     ref_y = (lm[11].y + lm[12].y) / 2 if len(lm) > 12 else 0.5
                     if nod_detector.update_and_check(nose_y, ref_y):
-                        nod_event = True
-            # --- 新增開始 ---
-            # 2.1 執行餐盤殘留分析
+                        result.nod_event = True
+            
             if self.analysis_options.get("opt_plate"):
-                # 呼叫 vision_analysis 模組中的函式
-                label, ratio, circle = va.estimate_plate_leftover(frame)
-
-                # 如果偵測到有效的狀態，就設定事件
+                label, _, circle = va.estimate_plate_leftover(frame)
                 if label in ["剩餘50%以上", "無剩餘"]:
-                    plate_event = label
-
-                # 無論如何，都將資訊更新到 display_info 以便 UI 顯示
-                display_info["plate_label"] = label
+                    result.plate_event = label
+                result.display_info["plate_label"] = label
                 if circle:
-                    display_info["plate_circle"] = circle
-            # --- 新增結束 ---
+                    result.display_info["plate_circle"] = circle
             
-            # 3. 將所有結果打包成標準格式
-            result = FrameResult(
-                processed_frame=frame,
-                nod_detected=nod_event,
-                emotion_detected=emotion_event,
-                plate_leftover_detected=plate_event,
-                display_info=display_info
-            )
-            
-            # 4. 將最終結果放入結果佇列
+            # --- 3. 將純數據的分析結果放入結果佇列 ---
             try:
-                self._result_queue.put_nowait(result)
+                self._analysis_result_queue.put_nowait(result)
             except Full:
-                try: 
-                    self._result_queue.get_nowait()
-                except Empty:
-                    pass
-                self._result_queue.put_nowait(result)
+                pass # 如果 UI 來不及取，就丟掉舊的數據
 
     def start(self):
         """對外公開的方法：啟動整個分析引擎。"""
         if self._camera_thread and self._camera_thread.is_alive():
-            print("警告：引擎已經在運行中。")
             return
-            
         self._stop_event.clear()
-        
-        # 啟動攝影機執行緒
         self._camera_thread = threading.Thread(target=self._camera_loop, daemon=True)
-        self._camera_thread.start()
-        
-        # 啟動分析執行緒
         self._worker_thread = threading.Thread(target=self._analysis_worker, daemon=True)
+        self._camera_thread.start()
         self._worker_thread.start()
 
     def stop(self):
         """對外公開的方法：停止整個分析引擎。"""
         self._stop_event.set()
-        if self._camera_thread and self._camera_thread.is_alive():
-            self._camera_thread.join(timeout=2)
-        if self._worker_thread and self._worker_thread.is_alive():
-            self._worker_thread.join(timeout=2)
-        
-        # 清理執行緒物件，確保下次可以重新啟動
+        if self._camera_thread: self._camera_thread.join(timeout=2)
+        if self._worker_thread: self._worker_thread.join(timeout=2)
         self._camera_thread = None
         self._worker_thread = None
 
-    def get_latest_result(self) -> Optional[FrameResult]:
-        """對外公開的方法：讓 UI 層從這裡獲取最新的分析結果。"""
+    # --- MODIFIED: 提供兩個獨立的獲取方法 ---
+    def get_latest_frame(self) -> Optional[np.ndarray]:
+        """(UI呼叫) 從高速公路獲取最新的原始畫面。"""
         try:
-            # 使用非阻塞方式獲取，避免 UI 卡住
-            return self._result_queue.get_nowait()
+            return self._frame_display_queue.get_nowait()
         except Empty:
             return None
 
+    def get_latest_analysis_result(self) -> Optional[AnalysisResult]:
+        """(UI呼叫) 從慢車道獲取最新的分析數據。"""
+        try:
+            return self._analysis_result_queue.get_nowait()
+        except Empty:
+            return None

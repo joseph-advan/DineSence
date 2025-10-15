@@ -1,13 +1,17 @@
-# customer_analysis_mvp/services/llm_handler.py
+# services/llm_handler.py
 
 import base64
 import io
 import json
 import asyncio
 import httpx
-from openai import AsyncOpenAI  # 改為導入 AsyncOpenAI
+from openai import AsyncOpenAI
+from openai.types.chat import ChatCompletion
 from PIL import Image
 import cv2
+
+# --- 導入我們建立的 prompt 讀取工具 ---
+from utils.prompt_loader import load_prompt_template
 
 # 使用 AsyncClient 進行非同步請求
 aclient = httpx.AsyncClient()
@@ -17,7 +21,6 @@ def get_openai_client(api_key):
     if not api_key:
         return None
     try:
-        # 改為初始化 AsyncOpenAI
         return AsyncOpenAI(api_key=api_key)
     except Exception as e:
         print(f"初始化 OpenAI Client 失敗: {e}")
@@ -30,9 +33,12 @@ def _image_to_base64(pil_image):
     return base64.b64encode(buffered.getvalue()).decode("utf-8")
 
 async def gpt_image_classify_3cls(face_bgr, client: AsyncOpenAI, model="gpt-4o-mini"):
-    """(非同步) 使用 GPT-4o-mini 進行三分類表情辨識。"""
-    if face_bgr is None: return "無臉"
-    if client is None: return "（未設定 API）"
+    """
+    (非同步) 使用 GPT-4o-mini 進行三分類表情辨識。
+    [MODIFIED] 現在返回 (情緒字串, Token用量物件) 的元組。
+    """
+    if face_bgr is None: return "無臉", None
+    if client is None: return "（未設定 API）", None
 
     pil_img = Image.fromarray(cv2.cvtColor(face_bgr, cv2.COLOR_BGR2RGB))
     b64_img = _image_to_base64(pil_img)
@@ -44,7 +50,6 @@ async def gpt_image_classify_3cls(face_bgr, client: AsyncOpenAI, model="gpt-4o-m
     )
     
     try:
-        # 使用 await 等待非同步呼叫完成
         resp = await client.chat.completions.create(
             model=model,
             messages=[{
@@ -57,12 +62,17 @@ async def gpt_image_classify_3cls(face_bgr, client: AsyncOpenAI, model="gpt-4o-m
             temperature=0, max_tokens=10
         )
         text = resp.choices[0].message.content.strip()
-        if "喜歡" in text: return "喜歡"
-        if "討厭" in text: return "討厭"
-        return "中性"
+        usage = resp.usage  # <-- [NEW] 獲取 Token 用量
+
+        emotion = "中性"
+        if "喜歡" in text: emotion = "喜歡"
+        if "討厭" in text: emotion = "討厭"
+        
+        return emotion, usage  # <-- [MODIFIED] 返回元組
+
     except Exception as e:
         print(f"表情分類 API 錯誤: {e}")
-        return "API 錯誤"
+        return "API 錯誤", None
 
 
 async def gpt_food_from_menu(plate_bgr, menu_items, client: AsyncOpenAI, model="gpt-4o-mini"):
@@ -106,33 +116,39 @@ async def gpt_food_from_menu(plate_bgr, menu_items, client: AsyncOpenAI, model="
         return {"label": "解析失敗", "confidence": 0.0, "rationale": str(e)[:120]}
 
 
+# --- [MODIFIED] 修改此函式以返回 (摘要文字, Token用量) 的元組 ---
 async def summarize_session(stats: dict, store_type: str, tone: str, tips_style: str,
                       client: AsyncOpenAI, model="gpt-4o-mini"):
-    """(非同步) 根據統計數據，生成客製化的顧客體驗摘要報告。"""
-    # ... (內部邏輯不變，只需要將 client.chat.completions.create 改為 await)
+    """
+    (非同步) 根據統計數據，生成客製化的顧客體驗摘要報告。
+    Prompt 模板從 /prompts 資料夾動態載入。
+    
+    Returns:
+        tuple[str, openai.types.CompletionUsage | None]: (摘要文字, Token 用量物件)
+    """
     if client is None:
-        return "（未設定 OPENAI_API_KEY，無法產生摘要）"
-
-    system_prompt = (
-        f"你是一位專業的{store_type}顧客體驗分析師。你的任務是將量化的行為數據，轉化為生動且富有洞察力的質化觀察報告。"
-        f"請使用「{tone}」的語氣撰寫，並從「{tips_style}」的角度提出具體建議。"
-    )
-    user_prompt = (
-        "這是一份顧客用餐期間的行為與情緒數據紀錄。請模擬你是一位在現場的觀察員，深入解讀這些數據背後的顧客體驗故事。\n\n"
-        "數據 (JSON格式):\n"
-        f"{json.dumps(stats, indent=2, ensure_ascii=False)}\n\n"
-        "請嚴格遵循以下格式輸出報告，用詞需自然流暢，避免制式化：\n\n"
-        "### 顧客動態觀察\n"
-        "（請依據 timeline 或情緒變化，用 2-3 句話生動地描述顧客可能的用餐過程...）\n\n"
-        "### 整體體驗評估\n"
-        "（綜合所有數據，歸納顧客本次的整體滿意度趨勢...）\n\n"
-        "### actionable 營運建議\n"
-        "（根據你的觀察，提出 2-3 點具體、可執行的改善建議。）\n\n"
-        "**特別注意**：如果數據中出現『討厭』表情或『剩餘50%以上』的次數總和超過 5 次，請在報告最上方加上一個【⚠️ 警示：需優先關注】的標題..."
-    )
+        return "（未設定 OPENAI_API_KEY，無法產生摘要）", None
 
     try:
-        r = await client.chat.completions.create( # <--- 改為 await
+        system_template = load_prompt_template('summarize_session', 'system')
+        user_template = load_prompt_template('summarize_session', 'user')
+    except FileNotFoundError as e:
+        error_msg = f"找不到 Prompt 模板檔案：{e}。請確認 'prompts/summarize_session/' 資料夾及內部的 .txt 檔案是否存在。"
+        print(error_msg)
+        return error_msg, None
+
+    system_prompt = system_template.format(
+        store_type=store_type,
+        tone=tone,
+        tips_style=tips_style
+    )
+    user_prompt = user_template.format(
+        stats_json=json.dumps(stats, indent=2, ensure_ascii=False)
+    )
+    
+    try:
+        # 接收完整的 API 回應物件
+        r: ChatCompletion = await client.chat.completions.create(
             model=model,
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -140,7 +156,14 @@ async def summarize_session(stats: dict, store_type: str, tone: str, tips_style:
             ],
             temperature=0.7, max_tokens=800,
         )
-        return r.choices[0].message.content
+        # 從回應物件中分別取出「內容」和「用量」
+        summary_text = r.choices[0].message.content
+        usage_data = r.usage
+        
+        # 將兩者作為一個元組返回
+        return summary_text, usage_data
+        
     except Exception as e:
+        error_msg = f"生成摘要時發生錯誤：{e}"
         print(f"摘要生成 API 錯誤: {e}")
-        return f"生成摘要時發生錯誤：{e}"
+        return error_msg, None
